@@ -186,20 +186,37 @@ class MINEXUSBot:
             chat_id = q.message.chat_id
 
             if not signal:
-                # Fallback signal dict in case of temporary yfinance delay
-                signal = {
-                    "pair_name": pair_obj["name"],
-                    "symbol": symbol,
-                    "pair_type": pair_obj["type"],
-                    "action": "CALL",
-                    "direction_emoji": "🚀 CALL (BUY)",
-                    "confidence": 75.0,
-                    "timeframe": tf,
-                    "entry_price": 0.0,
-                    "reasons": ["Technical Indicator Confluence", "Trend Continuation Bias"],
-                }
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ <b>Market Data Unavailable</b>\n\n"
+                        f"Could not fetch live data for <b>{pair_obj['name']}</b>.\n"
+                        "The market might be closed right now, or data is delayed.\n"
+                        "Please try another pair."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Try Another Pair", callback_data="ask_pair")
+                    ]])
+                )
+                return
 
             chart = await loop.run_in_executor(None, generate_signal_chart, signal)
+            if not chart:
+                await self.app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ <b>Chart Generation Error</b>\n\n"
+                        f"Could not generate live chart for <b>{pair_obj['name']}</b>.\n"
+                        "Please try again."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔄 Try Another Pair", callback_data="ask_pair")
+                    ]])
+                )
+                return
+
             await self.send_signal(str(chat_id), signal, chart)
             return
 
