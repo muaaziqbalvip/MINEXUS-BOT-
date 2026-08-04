@@ -227,7 +227,9 @@ def analyze_single(symbol: str, timeframe: str = "5M") -> Optional[Dict]:
     pair = next((p for p in ALL_PAIRS if p["symbol"] == symbol), None)
     if not pair:
         return None
-    # Force fresh data for on-demand requests
-    cache_key = f"{pair['yf']}_{{'1M':'5m','5M':'15m','15M':'30m','1H':'1h'}.get(timeframe,'5m')}"
+    # Force fresh data for on-demand requests — extract interval before f-string
+    iv_map    = {"1M": "5m", "5M": "15m", "15M": "30m", "1H": "1h"}
+    iv        = iv_map.get(timeframe, "5m")
+    cache_key = f"{pair['yf']}_{iv}"
     _ohlcv_cache.pop(cache_key, None)
     return analyze_pair(pair, timeframe)
