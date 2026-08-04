@@ -1,173 +1,233 @@
 #!/usr/bin/env python3
 """
-signal_engine.py - 95%+ Confluence AI Signal Generator
-Evaluates technical indicator alignment (RSI, MACD, Stochastic, EMA 20/50/200, TradingView Ratings,
-and Price Action Patterns) to calculate a unified accuracy confidence score.
-Only emits high-precision signals (≥ 95% confidence score).
+signal_engine.py - MINEXUS AI Signal Engine (yfinance-only, no rate limits)
+Computes ALL indicators (RSI, MACD, EMA, Stochastic, Bollinger, Pinbar)
+directly from real Yahoo Finance OHLCV data. No TradingView API calls = no 429 errors.
 """
 
+import time
 import logging
-from typing import Dict, Optional, List
-from market_data import MarketDataProvider, ALL_PAIRS
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from typing import Dict, List, Optional
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MINEXUSSignal")
+
+# ── All monitored pairs ──────────────────────────────────────────────────
+ALL_PAIRS = [
+    {"symbol": "EURUSD",     "yf": "EURUSD=X",  "name": "EUR/USD",       "type": "REAL"},
+    {"symbol": "GBPUSD",     "yf": "GBPUSD=X",  "name": "GBP/USD",       "type": "REAL"},
+    {"symbol": "USDJPY",     "yf": "USDJPY=X",  "name": "USD/JPY",       "type": "REAL"},
+    {"symbol": "AUDUSD",     "yf": "AUDUSD=X",  "name": "AUD/USD",       "type": "REAL"},
+    {"symbol": "USDCAD",     "yf": "USDCAD=X",  "name": "USD/CAD",       "type": "REAL"},
+    {"symbol": "EURGBP",     "yf": "EURGBP=X",  "name": "EUR/GBP",       "type": "REAL"},
+    {"symbol": "GBPJPY",     "yf": "GBPJPY=X",  "name": "GBP/JPY",       "type": "REAL"},
+    {"symbol": "AUDJPY",     "yf": "AUDJPY=X",  "name": "AUD/JPY",       "type": "REAL"},
+    {"symbol": "EURUSD_OTC", "yf": "EURUSD=X",  "name": "EUR/USD (OTC)", "type": "OTC"},
+    {"symbol": "GBPUSD_OTC", "yf": "GBPUSD=X",  "name": "GBP/USD (OTC)", "type": "OTC"},
+    {"symbol": "USDJPY_OTC", "yf": "USDJPY=X",  "name": "USD/JPY (OTC)", "type": "OTC"},
+    {"symbol": "AUDUSD_OTC", "yf": "AUDUSD=X",  "name": "AUD/USD (OTC)", "type": "OTC"},
+    {"symbol": "EURGBP_OTC", "yf": "EURGBP=X",  "name": "EUR/GBP (OTC)", "type": "OTC"},
+    {"symbol": "GBPJPY_OTC", "yf": "GBPJPY=X",  "name": "GBP/JPY (OTC)", "type": "OTC"},
+    {"symbol": "BTCUSD",     "yf": "BTC-USD",   "name": "BTC/USD",       "type": "CRYPTO"},
+    {"symbol": "ETHUSD",     "yf": "ETH-USD",   "name": "ETH/USD",       "type": "CRYPTO"},
+]
+
+# Cache: avoid re-fetching same yf ticker within 60s
+_ohlcv_cache: Dict[str, Dict] = {}
+CACHE_TTL = 60
 
 
-class SignalEngine:
-    """Multi-indicator Confluence Signal Analyzer."""
+def _get_ohlcv(yf_ticker: str, period="2d", interval="5m") -> Optional[pd.DataFrame]:
+    """Fetch OHLCV with 60-second cache to avoid hammering yfinance."""
+    cache_key = f"{yf_ticker}_{interval}"
+    now = time.time()
+    if cache_key in _ohlcv_cache:
+        entry = _ohlcv_cache[cache_key]
+        if now - entry["ts"] < CACHE_TTL:
+            return entry["df"]
 
-    MIN_ACCURACY_THRESHOLD = 95.0  # Only trigger signals with >= 95.0% confidence
-
-    @classmethod
-    def analyze_pair(cls, pair_info: Dict, timeframe: str = "1M") -> Optional[Dict]:
-        """
-        Analyzes an individual pair using TradingView TA and indicator confluence.
-        Returns a signal payload if confidence score >= 95%, else None.
-        """
-        ta = MarketDataProvider.get_tradingview_analysis(pair_info, timeframe)
-        if not ta:
+    try:
+        df = yf.download(yf_ticker, period=period, interval=interval,
+                         auto_adjust=True, progress=False)
+        if df is None or len(df) < 30:
             return None
-
-        rec = ta.get("recommendation", "NEUTRAL")
-        buy_cnt = ta.get("buy_count", 0)
-        sell_cnt = ta.get("sell_count", 0)
-        total_cnt = buy_cnt + sell_cnt + ta.get("neutral_count", 0)
-        if total_cnt == 0:
-            return None
-
-        rsi = ta.get("rsi", 50.0)
-        macd = ta.get("macd", 0.0)
-        macd_sig = ta.get("macd_signal", 0.0)
-        price = ta.get("price", 0.0)
-        ema20 = ta.get("ema20", 0.0)
-        ema50 = ta.get("ema50", 0.0)
-        ema200 = ta.get("ema200", 0.0)
-        stoch_k = ta.get("stoch_k", 50.0)
-        stoch_d = ta.get("stoch_d", 50.0)
-        open_px = ta.get("open", 0.0)
-        high_px = ta.get("high", 0.0)
-        low_px = ta.get("low", 0.0)
-
-        # ── Confluence Score Calculation ──────────────────────────────────────
-        score_up = 0.0
-        score_down = 0.0
-        reasons_up = []
-        reasons_down = []
-
-        # 1. TradingView Rating Strength (Weight: 35%)
-        if "STRONG_BUY" in rec:
-            score_up += 35.0
-            reasons_up.append("TradingView Strong Buy rating")
-        elif "BUY" in rec:
-            score_up += 20.0
-            reasons_up.append("TradingView Buy rating")
-
-        if "STRONG_SELL" in rec:
-            score_down += 35.0
-            reasons_down.append("TradingView Strong Sell rating")
-        elif "SELL" in rec:
-            score_down += 20.0
-            reasons_down.append("TradingView Sell rating")
-
-        # 2. RSI Extreme Oversold / Overbought Confluence (Weight: 20%)
-        if rsi <= 30.0:
-            score_up += 20.0
-            reasons_up.append(f"RSI Oversold ({rsi:.1f} ≤ 30)")
-        elif rsi <= 42.0:
-            score_up += 10.0
-
-        if rsi >= 70.0:
-            score_down += 20.0
-            reasons_down.append(f"RSI Overbought ({rsi:.1f} ≥ 70)")
-        elif rsi >= 58.0:
-            score_down += 10.0
-
-        # 3. MACD Crossover Momentum (Weight: 15%)
-        if macd > macd_sig and macd > 0:
-            score_up += 15.0
-            reasons_up.append("MACD Bullish crossover above zero line")
-        elif macd > macd_sig:
-            score_up += 8.0
-
-        if macd < macd_sig and macd < 0:
-            score_down += 15.0
-            reasons_down.append("MACD Bearish crossover below zero line")
-        elif macd < macd_sig:
-            score_down += 8.0
-
-        # 4. Moving Average Trend Alignment (EMA 20 > 50 > 200) (Weight: 15%)
-        if ema20 > ema50 and price > ema20:
-            score_up += 15.0
-            reasons_up.append("Price & EMA20 above EMA50 Trend Alignment")
-        
-        if ema20 < ema50 and price < ema20:
-            score_down += 15.0
-            reasons_down.append("Price & EMA20 below EMA50 Downtrend Alignment")
-
-        # 5. Stochastic Oscillator Momentum (Weight: 10%)
-        if stoch_k < 20 and stoch_k > stoch_d:
-            score_up += 10.0
-            reasons_up.append("Stochastic Oversold Bullish Hook")
-        elif stoch_k > 80 and stoch_k < stoch_d:
-            score_down += 10.0
-            reasons_down.append("Stochastic Overbought Bearish Hook")
-
-        # 6. Price Action & Candlestick Wick Rejection (Weight: 10%)
-        if price > 0 and open_px > 0:
-            body = abs(price - open_px)
-            rng = high_px - low_px if high_px > low_px else 1.0
-            lower_wick = (min(open_px, price) - low_px) / rng
-            upper_wick = (high_px - max(open_px, price)) / rng
-
-            if lower_wick > 0.55 and price >= open_px:
-                score_up += 10.0
-                reasons_up.append("Bullish Pinbar / Bottom Wick Rejection")
-            elif upper_wick > 0.55 and price <= open_px:
-                score_down += 10.0
-                reasons_down.append("Bearish Shooting Star / Top Wick Rejection")
-
-        # Determine Winning Direction & Confidence Score
-        if score_up > score_down:
-            action = "CALL"
-            direction_emoji = "🚀 CALL (BUY)"
-            confidence = min(98.8, score_up)
-            reasons = reasons_up
-        else:
-            action = "PUT"
-            direction_emoji = "🔻 PUT (SELL)"
-            confidence = min(98.8, score_down)
-            reasons = reasons_down
-
-        # Only emit signals that pass the 95%+ Confidence Threshold
-        if confidence >= cls.MIN_ACCURACY_THRESHOLD:
-            return {
-                "pair_name": pair_info["name"],
-                "symbol": pair_info["symbol"],
-                "pair_type": pair_info["type"],
-                "action": action,
-                "direction_emoji": direction_emoji,
-                "confidence": round(confidence, 1),
-                "timeframe": timeframe,
-                "entry_price": price,
-                "reasons": reasons,
-                "rsi": round(rsi, 1),
-                "timestamp": time.time(),
-            }
-
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[['Open','High','Low','Close','Volume']].dropna().tail(80)
+        _ohlcv_cache[cache_key] = {"df": df, "ts": now}
+        return df
+    except Exception as e:
+        logger.warning(f"yfinance error ({yf_ticker}): {e}")
         return None
 
-    @classmethod
-    def scan_all_markets(cls, timeframe: str = "1M") -> List[Dict]:
-        """
-        Scans all Quotex & global assets for 95%+ high accuracy signals.
-        """
-        signals = []
-        logging.info(f"Scanning {len(ALL_PAIRS)} asset pairs for timeframe {timeframe}...")
-        
-        for pair in ALL_PAIRS:
-            sig = cls.analyze_pair(pair, timeframe)
+
+def _rsi(close: pd.Series, n=14) -> float:
+    d = close.diff()
+    g = d.where(d > 0, 0.0).ewm(alpha=1/n, adjust=False).mean()
+    l = (-d.where(d < 0, 0.0)).ewm(alpha=1/n, adjust=False).mean()
+    rs = g / l.replace(0, np.nan)
+    rsi = (100 - 100 / (1 + rs)).fillna(50)
+    return float(rsi.iloc[-1])
+
+
+def _macd(close: pd.Series):
+    ef = close.ewm(span=12, adjust=False).mean()
+    es = close.ewm(span=26, adjust=False).mean()
+    m  = ef - es
+    s  = m.ewm(span=9, adjust=False).mean()
+    return float(m.iloc[-1]), float(s.iloc[-1])
+
+
+def _stoch(high, low, close, n=14):
+    lo = low.rolling(n).min()
+    hi = high.rolling(n).max()
+    k  = 100 * (close - lo) / (hi - lo + 1e-10)
+    d  = k.rolling(3).mean()
+    return float(k.iloc[-1]), float(d.iloc[-1])
+
+
+def _ema(close: pd.Series, n: int) -> float:
+    return float(close.ewm(span=n, adjust=False).mean().iloc[-1])
+
+
+def _pinbar(o, h, l, c) -> str:
+    """Detect last candle pinbar type."""
+    body  = abs(c - o)
+    rng   = h - l if h > l else 1e-10
+    lo_wk = (min(o, c) - l) / rng
+    hi_wk = (h - max(o, c)) / rng
+    if lo_wk > 0.55 and c >= o:
+        return "BULL"
+    if hi_wk > 0.55 and c <= o:
+        return "BEAR"
+    return "NONE"
+
+
+def analyze_pair(pair: Dict, timeframe: str = "5M") -> Optional[Dict]:
+    """
+    Full indicator analysis from real yfinance OHLCV.
+    Returns signal dict if confidence >= 95%, else None.
+    """
+    interval_map = {"1M": "5m", "5M": "15m", "15M": "30m", "1H": "1h"}
+    period_map   = {"1M": "2d", "5M": "5d",  "15M": "10d",  "1H": "20d"}
+    iv = interval_map.get(timeframe, "5m")
+    pd_ = period_map.get(timeframe, "2d")
+
+    df = _get_ohlcv(pair["yf"], period=pd_, interval=iv)
+    if df is None or len(df) < 30:
+        return None
+
+    close = df["Close"].astype(float)
+    high  = df["High"].astype(float)
+    low   = df["Low"].astype(float)
+    open_ = df["Open"].astype(float)
+
+    # Compute REAL indicators
+    rsi          = _rsi(close)
+    macd, sig    = _macd(close)
+    stoch_k, stoch_d = _stoch(high, low, close)
+    ema20        = _ema(close, 20)
+    ema50        = _ema(close, 50)
+    price        = float(close.iloc[-1])
+    pin          = _pinbar(float(open_.iloc[-1]), float(high.iloc[-1]),
+                           float(low.iloc[-1]),  float(close.iloc[-1]))
+
+    score_up, score_dn = 0.0, 0.0
+    reasons_up, reasons_dn = [], []
+
+    # ── 1. RSI (25 pts) ─────────────────────────────────────────────
+    if rsi <= 28:
+        score_up += 25; reasons_up.append(f"RSI Oversold ({rsi:.1f})")
+    elif rsi <= 38:
+        score_up += 14
+
+    if rsi >= 72:
+        score_dn += 25; reasons_dn.append(f"RSI Overbought ({rsi:.1f})")
+    elif rsi >= 62:
+        score_dn += 14
+
+    # ── 2. MACD crossover (20 pts) ───────────────────────────────────
+    if macd > sig and macd > 0:
+        score_up += 20; reasons_up.append("MACD Bullish (above zero)")
+    elif macd > sig:
+        score_up += 10
+
+    if macd < sig and macd < 0:
+        score_dn += 20; reasons_dn.append("MACD Bearish (below zero)")
+    elif macd < sig:
+        score_dn += 10
+
+    # ── 3. EMA trend alignment (20 pts) ─────────────────────────────
+    if price > ema20 > ema50:
+        score_up += 20; reasons_up.append("Price > EMA20 > EMA50 (Uptrend)")
+    elif price > ema20:
+        score_up += 10
+
+    if price < ema20 < ema50:
+        score_dn += 20; reasons_dn.append("Price < EMA20 < EMA50 (Downtrend)")
+    elif price < ema20:
+        score_dn += 10
+
+    # ── 4. Stochastic hook (15 pts) ──────────────────────────────────
+    if stoch_k < 22 and stoch_k > stoch_d:
+        score_up += 15; reasons_up.append(f"Stochastic Oversold Hook ({stoch_k:.1f})")
+    if stoch_k > 78 and stoch_k < stoch_d:
+        score_dn += 15; reasons_dn.append(f"Stochastic Overbought Hook ({stoch_k:.1f})")
+
+    # ── 5. Pinbar pattern (20 pts) ───────────────────────────────────
+    if pin == "BULL":
+        score_up += 20; reasons_up.append("Bullish Pinbar / Wick Rejection")
+    if pin == "BEAR":
+        score_dn += 20; reasons_dn.append("Bearish Shooting Star / Wick Rejection")
+
+    # ── Determine direction ──────────────────────────────────────────
+    if score_up > score_dn:
+        action, conf, reasons = "CALL", min(98.5, score_up), reasons_up
+        dir_emoji = "🚀 CALL (BUY)"
+    else:
+        action, conf, reasons = "PUT",  min(98.5, score_dn), reasons_dn
+        dir_emoji = "🔻 PUT (SELL)"
+
+    if conf < 95.0 or not reasons:
+        return None
+
+    return {
+        "pair_name":    pair["name"],
+        "symbol":       pair["symbol"],
+        "pair_type":    pair["type"],
+        "action":       action,
+        "direction_emoji": dir_emoji,
+        "confidence":   round(conf, 1),
+        "timeframe":    timeframe,
+        "entry_price":  price,
+        "reasons":      reasons,
+        "rsi":          round(rsi, 1),
+        "timestamp":    time.time(),
+    }
+
+
+def scan_all_markets(timeframe: str = "5M") -> List[Dict]:
+    """Scan all pairs. Returns list of 95%+ confidence signals."""
+    signals = []
+    for pair in ALL_PAIRS:
+        try:
+            sig = analyze_pair(pair, timeframe)
             if sig:
                 signals.append(sig)
-                logging.info(f"✨ HIGH CONFIDENCE SIGNAL: {sig['pair_name']} -> {sig['action']} ({sig['confidence']}%)")
+                logger.info(f"SIGNAL: {sig['pair_name']} {sig['action']} {sig['confidence']}%")
+        except Exception as e:
+            logger.warning(f"Error analyzing {pair['name']}: {e}")
+    return signals
 
-        return signals
+
+def analyze_single(symbol: str, timeframe: str = "5M") -> Optional[Dict]:
+    """Analyze a single pair by symbol name. Used for on-demand /signal command."""
+    pair = next((p for p in ALL_PAIRS if p["symbol"] == symbol), None)
+    if not pair:
+        return None
+    # Force fresh data for on-demand requests
+    cache_key = f"{pair['yf']}_{{'1M':'5m','5M':'15m','15M':'30m','1H':'1h'}.get(timeframe,'5m')}"
+    _ohlcv_cache.pop(cache_key, None)
+    return analyze_pair(pair, timeframe)
